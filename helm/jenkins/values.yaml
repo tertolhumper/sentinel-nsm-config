@@ -1,0 +1,27 @@
+controller:
+  serviceType: NodePort
+  nodePort: 30082
+  admin:
+    createSecret: false
+    existingSecret: jenkins-admin-secret
+  installPlugins:
+    - kubernetes:latest
+    - workflow-aggregator:latest
+    - git:latest
+    - configuration-as-code:latest
+  containerEnv:
+    - name: chart-admin-username
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-admin-secret
+          key: jenkins-admin-user
+    - name: chart-admin-password
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-admin-secret
+          key: jenkins-admin-password
+
+persistence:
+  enabled: true
+  storageClass: nfs-client
+  size: 10Gi
