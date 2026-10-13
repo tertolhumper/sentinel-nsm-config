@@ -1,14 +1,15 @@
 controller:
+  image:
+    registry: ghcr.io
+    repository: tertolhumper/sentinel-nsm-jenkins
+    tag: latest
+    pullPolicy: Always
   serviceType: NodePort
   nodePort: 30082
   admin:
     createSecret: false
     existingSecret: jenkins-admin-secret
-  installPlugins:
-    - kubernetes:latest
-    - workflow-aggregator:latest
-    - git:latest
-    - configuration-as-code:latest
+  installPlugins: []
   containerEnv:
     - name: chart-admin-username
       valueFrom:
