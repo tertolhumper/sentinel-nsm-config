@@ -11,6 +11,8 @@ controller:
     existingSecret: jenkins-admin-secret
   installPlugins: []
   containerEnv:
+    - name: TZ
+      value: Asia/Manila
     - name: chart-admin-username
       valueFrom:
         secretKeyRef:
