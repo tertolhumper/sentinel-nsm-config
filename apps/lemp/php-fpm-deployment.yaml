@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-fpm
+  namespace: lemp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: php-fpm
+  template:
+    metadata:
+      labels:
+        app: php-fpm
+    spec:
+      containers:
+      - name: php-fpm
+        image: ghcr.io/tertolhumper/sentinel-nsm-app:16
+        imagePullPolicy: Always
+        command:
+        - sh
+        - -c
+        - docker-php-ext-install mysqli pdo_mysql && php-fpm
+        ports:
+        - containerPort: 9000
+        env:
+        - name: VAULT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sentinel-app-secrets
+              key: VAULT_TOKEN
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mariadb-passwords
+              key: mariadb-password
+        volumeMounts:
+        - mountPath: /var/www/html
+          name: php-app
+      volumes:
+      - name: php-app
+        configMap:
+          name: php-app
