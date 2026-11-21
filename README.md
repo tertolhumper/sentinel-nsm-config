@@ -1,34 +1,41 @@
 # sentinel-nsm-config
 
-Sentinel-NSM Kubernetes GitOps configuration repository.
-
-## Overview
-
-This repository contains all GitOps-managed configuration for the Sentinel-NSM Kubernetes cluster. Application source code and CI pipelines live in [sentinel-nsm-app](https://github.com/tertolhumper/sentinel-nsm-app).
-
-## Components
-
-- **Argo CD** – Continuous delivery and GitOps reconciliation against this repository.
-- **Helm** – Kubernetes application and infrastructure configuration via chart values.
-- **Kubernetes manifests** – Application resources, including the PHP application ConfigMap.
+Sentinel NSM Kubernetes GitOps configuration repository. All cluster state is managed here. Application source code and CI pipelines live in [sentinel-nsm-app](https://github.com/tertolhumper/sentinel-nsm-app).
 
 ## Repository Structure
 
-```text
-argocd/       Argo CD Application definitions
-apps/lemp/    PHP application ConfigMap
-helm/         Helm chart values and configurations
-```
+    argocd/           ArgoCD Application definitions
+    apps/lemp/        PHP-FPM deployment manifest and ConfigMap
+    helm/argocd/      ArgoCD Helm values
+    helm/jenkins/     Jenkins Helm values
+    helm/lemp/        LEMP stack Helm values
+    helm/nfs/         NFS provisioner Helm values
+    helm/prometheus/  kube-prometheus-stack Helm values
+    helm/vault/       HashiCorp Vault Helm values
 
 ## Deployment Flow
 
-```text
-[sentinel-nsm-app]                    [sentinel-nsm-config]
-Code push → Jenkins CI                Config push → Argo CD
-            ↓                                       ↓
-            Build & test                            Sync Helm values / manifests
-            ↓                                       ↓
-            Push image → GHCR                       Kubernetes cluster
-```
+    Push to sentinel-nsm-app
+      → Jenkins CI builds PHP-FPM image via Kaniko (no privileged pods)
+      → Pushes image to ghcr.io/tertolhumper/sentinel-nsm-app:<build>
+      → Jenkins commits updated image tag to apps/lemp/php-fpm-deployment.yaml
+      → ArgoCD detects commit and syncs to cluster
 
-Jenkins handles all CI tasks: building, testing, and pushing container images to GHCR. Argo CD watches this repository and reconciles the cluster state on every config push.
+## ArgoCD Applications
+
+| Application | Path | Namespace |
+|---|---|---|
+| sentinel-nsm | helm/argocd | argocd |
+| sentinel-php-app | apps/lemp | lemp |
+
+## Stack
+
+- Kubernetes v1.37.0 — 6-node HA cluster on Proxmox
+- Cilium CNI
+- HashiCorp Vault HA — secrets management
+- External Secrets Operator
+- kube-prometheus-stack — Prometheus, Grafana, Alertmanager
+- ArgoCD — GitOps continuous delivery
+- Jenkins — CI pipelines with Kaniko builds
+- LEMP — nginx, PHP-FPM, MariaDB
+- Cloudflare Tunnel — external access
