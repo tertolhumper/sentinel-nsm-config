@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: php-fpm
-        image: ghcr.io/tertolhumper/sentinel-nsm-app:20
+        image: ghcr.io/tertolhumper/sentinel-nsm-app:21
         imagePullPolicy: Always
         command:
         - sh
