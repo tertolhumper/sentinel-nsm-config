@@ -5,19 +5,27 @@ data:
     // SESSION AUTH
     session_start();
 
+    // ── MOCK PAYMONGO WEBHOOK SECRET ──────────────────────────────────────────────
+    define('WEBHOOK_SECRET', 'mock-sentinel-webhook-secret-2026');
+
+    // ── INTERNAL WEBHOOK PROCESSOR (called inline, no HTTP hairpin) ───────────────
+    function process_webhook($pdo, $pid, $amount) {
+        if (!$pdo || !$pid) return;
+        try {
+            $stmt = $pdo->prepare('UPDATE transactions SET status=?, webhook_event=?, updated_at=NOW() WHERE paymongo_id=?');
+            $stmt->execute(['paid', 'payment.paid', $pid]);
+        } catch (PDOException $e) {}
+    }
+
     // Handle login POST
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_username'])) {
         $u = trim($_POST['login_username'] ?? '');
         $p = trim($_POST['login_password'] ?? '');
 
-        // Fetch password from Vault
         $vault_token  = getenv('VAULT_TOKEN') ?: '';
         $vault_url    = 'http://vault.vault.svc.cluster.local:8200/v1/secret/data/sentinel-admin';
         $vault_resp   = @file_get_contents($vault_url, false, stream_context_create([
-            'http' => [
-                'header' => "X-Vault-Token: $vault_token\r\n",
-                'timeout' => 3,
-            ]
+            'http' => ['header' => "X-Vault-Token: $vault_token\r\n", 'timeout' => 3]
         ]));
 
         $admin_user = '';
@@ -48,8 +56,8 @@ data:
         exit;
     }
 
-    $is_auth      = $_SESSION['authenticated'] ?? false;
-    $login_error  = $_SESSION['login_error'] ?? false;
+    $is_auth     = $_SESSION['authenticated'] ?? false;
+    $login_error = $_SESSION['login_error'] ?? false;
     unset($_SESSION['login_error']);
 
     $host = 'mariadb';
@@ -66,22 +74,15 @@ data:
         ]);
     } catch (PDOException $e) {}
 
-    // Handle email registration POST
+    // ── EMAIL REGISTRATION ────────────────────────────────────────────────────────
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['email'])) {
         header('Content-Type: application/json');
         $email = filter_var(trim($_POST['email']), FILTER_VALIDATE_EMAIL);
-        if (!$email) {
-            echo json_encode(['success' => false, 'message' => 'Invalid email address.']);
-            exit;
-        }
+        if (!$email) { echo json_encode(['success' => false, 'message' => 'Invalid email address.']); exit; }
         if ($pdo) {
             try {
                 $stmt = $pdo->prepare('INSERT IGNORE INTO launch_notifications (email, ip_hash, user_agent) VALUES (?, ?, ?)');
-                $stmt->execute([
-                    $email,
-                    hash('sha256', $_SERVER['REMOTE_ADDR'] ?? ''),
-                    substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 500),
-                ]);
+                $stmt->execute([$email, hash('sha256', $_SERVER['REMOTE_ADDR'] ?? ''), substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 500)]);
                 echo json_encode(['success' => true, 'message' => 'Registered successfully.']);
             } catch (PDOException $e) {
                 echo json_encode(['success' => false, 'message' => 'Registration failed.']);
@@ -92,8 +93,91 @@ data:
         exit;
     }
 
-    // Handle dashboard API
-    if ($_SERVER['REQUEST_URI'] === '/api/dashboard.php' || ($_GET['api'] ?? '') === 'dashboard') {
+    // ── WEBHOOK RECEIVER (for real PayMongo when available) ───────────────────────
+    if (($_GET['api'] ?? '') === 'webhook' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        header('Content-Type: application/json');
+        $payload  = file_get_contents('php://input');
+        $sig      = $_SERVER['HTTP_X_PAYMONGO_SIGNATURE'] ?? '';
+        $computed = hash_hmac('sha256', $payload, WEBHOOK_SECRET);
+        if (!hash_equals($computed, $sig)) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Invalid signature']);
+            exit;
+        }
+        $event  = json_decode($payload, true);
+        $pid    = $event['data']['id'] ?? '';
+        $status = $event['data']['attributes']['status'] ?? 'paid';
+        $wtype  = $event['data']['type'] ?? 'payment.paid';
+        if ($pdo && $pid) {
+            try {
+                $stmt = $pdo->prepare('UPDATE transactions SET status=?, webhook_event=?, updated_at=NOW() WHERE paymongo_id=?');
+                $stmt->execute([$status, $wtype, $pid]);
+            } catch (PDOException $e) {}
+        }
+        http_response_code(200);
+        echo json_encode(['received' => true]);
+        exit;
+    }
+
+    // ── MOCK PAYMENT INITIATOR ────────────────────────────────────────────────────
+    if (($_GET['api'] ?? '') === 'pay' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        header('Content-Type: application/json');
+        if (!$is_auth) { http_response_code(403); echo json_encode(['error' => 'Unauthorized']); exit; }
+        $amount      = (int)($_POST['amount'] ?? 0);
+        $description = substr(trim($_POST['description'] ?? 'Test Payment'), 0, 500);
+        $source_type = $_POST['source_type'] ?? 'card';
+        if ($amount < 100) {
+            echo json_encode(['success' => false, 'message' => 'Minimum amount is ₱1.00 (100 centavos)']);
+            exit;
+        }
+        $pid = 'pay_mock_' . bin2hex(random_bytes(10));
+        if ($pdo) {
+            try {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO transactions (paymongo_id, amount, currency, status, source_type, description, webhook_event, raw_payload, ip_hash)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                );
+                $stmt->execute([
+                    $pid, $amount, 'PHP', 'pending', $source_type, $description,
+                    'payment.pending',
+                    json_encode(['mock' => true, 'amount' => $amount, 'description' => $description]),
+                    hash('sha256', $_SERVER['REMOTE_ADDR'] ?? ''),
+                ]);
+                // Process webhook inline — no HTTP hairpin
+                process_webhook($pdo, $pid, $amount);
+            } catch (PDOException $e) {
+                echo json_encode(['success' => false, 'message' => 'DB error: ' . $e->getMessage()]);
+                exit;
+            }
+        }
+        echo json_encode(['success' => true, 'paymongo_id' => $pid, 'message' => 'Payment processed']);
+        exit;
+    }
+
+    // ── TRANSACTIONS API ──────────────────────────────────────────────────────────
+    if (($_GET['api'] ?? '') === 'transactions') {
+        header('Content-Type: application/json');
+        if (!$is_auth) { http_response_code(403); echo json_encode(['error' => 'Unauthorized']); exit; }
+        $rows  = [];
+        $total = 0;
+        $paid  = 0;
+        if ($pdo) {
+            try {
+                $rows  = $pdo->query(
+                    'SELECT paymongo_id, amount, currency, status, source_type, description, webhook_event,
+                            DATE_FORMAT(created_at,"%Y-%m-%d %H:%i:%s") AS created_at
+                     FROM transactions ORDER BY created_at DESC LIMIT 50'
+                )->fetchAll();
+                $total = (int)$pdo->query('SELECT COUNT(*) FROM transactions')->fetchColumn();
+                $paid  = (int)$pdo->query("SELECT COUNT(*) FROM transactions WHERE status='paid'")->fetchColumn();
+            } catch (PDOException $e) {}
+        }
+        echo json_encode(['transactions' => $rows, 'total' => $total, 'paid' => $paid]);
+        exit;
+    }
+
+    // ── DASHBOARD API ─────────────────────────────────────────────────────────────
+    if (($_GET['api'] ?? '') === 'dashboard') {
         header('Content-Type: application/json');
         $response = [
             'visits'             => 0,
@@ -109,9 +193,9 @@ data:
         ];
         if ($pdo) {
             try {
-                $response['visits']       = (int) $pdo->query('SELECT COUNT(*) FROM visitors')->fetchColumn();
-                $response['registrations'] = (int) $pdo->query('SELECT COUNT(*) FROM launch_notifications')->fetchColumn();
-                $response['telemetry']    = $pdo->query(
+                $response['visits']             = (int)$pdo->query('SELECT COUNT(*) FROM visitors')->fetchColumn();
+                $response['registrations']      = (int)$pdo->query('SELECT COUNT(*) FROM launch_notifications')->fetchColumn();
+                $response['telemetry']          = $pdo->query(
                     'SELECT DATE_FORMAT(created_at,"%Y-%m-%d %H:%i:%s") AS timestamp, path, user_agent AS ua
                      FROM visitors ORDER BY created_at DESC LIMIT 20'
                 )->fetchAll();
@@ -125,7 +209,7 @@ data:
         exit;
     }
 
-    // Track visit
+    // ── TRACK VISIT ───────────────────────────────────────────────────────────────
     if ($pdo) {
         try {
             $stmt = $pdo->prepare('INSERT INTO visitors (ip_hash, path, user_agent) VALUES (?, ?, ?)');
@@ -274,6 +358,25 @@ data:
     .sys-badge.ready{background:rgba(0,194,203,0.1);color:var(--teal)}
     .sys-badge.offline{background:rgba(229,57,53,0.12);color:var(--red)}
     .reg-empty{text-align:center;padding:36px 20px;color:var(--slate);font-size:13px}
+    .pay-form{display:flex;flex-direction:column;gap:14px}
+    .pay-label{font-size:11px;font-weight:500;color:var(--slate);letter-spacing:0.08em;display:block;margin-bottom:6px}
+    .pay-input{width:100%;background:var(--navy);border:1px solid var(--border-subtle);color:var(--white);font-family:inherit;font-size:13px;padding:10px 12px;outline:none;transition:border-color 0.2s;border-radius:0}
+    .pay-input:focus{border-color:var(--teal-dim)}
+    .pay-input::placeholder{color:var(--slate)}
+    .pay-select{width:100%;background:var(--navy);border:1px solid var(--border-subtle);color:var(--white);font-family:inherit;font-size:13px;padding:10px 12px;outline:none;border-radius:0;-webkit-appearance:none}
+    .btn-pay{background:var(--teal);color:var(--navy);font-size:12px;font-weight:600;padding:11px 24px;border:none;cursor:pointer;letter-spacing:0.04em;transition:background 0.2s;width:100%}
+    .btn-pay:hover{background:#00D6E0}
+    .btn-pay:disabled{background:var(--slate);cursor:not-allowed}
+    .pay-msg{font-size:12px;margin-top:8px;display:none}
+    .pay-msg.ok{color:var(--green)}.pay-msg.err{color:var(--red)}
+    .tx-status{font-size:10px;font-weight:600;letter-spacing:0.06em;padding:2px 7px;display:inline-block}
+    .tx-status.paid{background:rgba(16,185,129,0.12);color:var(--green)}
+    .tx-status.pending{background:rgba(245,158,11,0.12);color:var(--amber)}
+    .tx-status.failed{background:rgba(229,57,53,0.12);color:var(--red)}
+    .tx-kpi{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border-subtle);border:1px solid var(--border-subtle);margin-bottom:18px}
+    .tx-kpi-card{background:var(--navy-mid);padding:16px 14px}
+    .tx-kpi-label{font-size:10px;color:var(--slate);letter-spacing:0.08em;margin-bottom:6px}
+    .tx-kpi-value{font-size:20px;font-weight:700;color:var(--white)}
     @media(max-width:768px){
       nav{padding:12px 16px}.status-badge{display:none}
       .hero{padding:90px 16px 60px}.hero-glow{display:none}
@@ -457,59 +560,122 @@ data:
         <div class="dash-sidebar">
           <div class="sidebar-section">
             <div class="sidebar-label">Overview</div>
-            <div class="sidebar-item active">
+            <div class="sidebar-item active" id="nav-dashboard" onclick="showDashPanel('dashboard')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>Dashboard
             </div>
-            <div class="sidebar-item">
+            <div class="sidebar-item" id="nav-telemetry" onclick="showDashPanel('dashboard')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>Telemetry
             </div>
-            <div class="sidebar-item">
+            <div class="sidebar-item" id="nav-regs" onclick="showDashPanel('dashboard')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Registrations
             </div>
           </div>
           <div class="sidebar-section">
             <div class="sidebar-label">System</div>
-            <div class="sidebar-item">
+            <div class="sidebar-item" id="nav-system" onclick="showDashPanel('dashboard')">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>System Status
+            </div>
+          </div>
+          <div class="sidebar-section">
+            <div class="sidebar-label">Integrations</div>
+            <div class="sidebar-item" id="nav-payment" onclick="showDashPanel('payment')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"/></svg>Payment Gateway
             </div>
           </div>
         </div>
         <div class="dash-main">
-          <div class="dash-title">Operations Overview</div>
-          <div class="dash-subtitle" id="dash-time">—</div>
-          <div class="kpi-row">
-            <div class="kpi-card"><div class="kpi-label">Total Visits</div><div class="kpi-value" id="kpi-visits">—</div><div class="kpi-delta">Live from MariaDB</div></div>
-            <div class="kpi-card"><div class="kpi-label">Registrations</div><div class="kpi-value" id="kpi-regs">—</div><div class="kpi-delta">Launch signups</div></div>
-            <div class="kpi-card"><div class="kpi-label">Application</div><div class="kpi-value" id="kpi-status" style="font-size:15px;padding-top:6px">—</div><div class="kpi-delta" id="kpi-host">—</div></div>
-            <div class="kpi-card"><div class="kpi-label">PHP Runtime</div><div class="kpi-value" id="kpi-php" style="font-size:16px;padding-top:5px">—</div><div class="kpi-delta">App server</div></div>
-          </div>
-          <div class="dash-grid">
-            <div class="dash-panel">
-              <div class="panel-header"><div class="panel-title">Recent Web Telemetry</div><div class="panel-meta" id="tele-count">—</div></div>
-              <table class="tele-table">
-                <thead><tr><th>Timestamp</th><th>Path</th><th>User Agent</th></tr></thead>
-                <tbody id="tele-body"><tr><td colspan="3" style="color:var(--slate);padding:20px 0;font-size:12px">Loading...</td></tr></tbody>
-              </table>
+
+          <!-- MAIN DASHBOARD PANEL -->
+          <div id="main-panel">
+            <div class="dash-title">Operations Overview</div>
+            <div class="dash-subtitle" id="dash-time">—</div>
+            <div class="kpi-row">
+              <div class="kpi-card"><div class="kpi-label">Total Visits</div><div class="kpi-value" id="kpi-visits">—</div><div class="kpi-delta">Live from MariaDB</div></div>
+              <div class="kpi-card"><div class="kpi-label">Registrations</div><div class="kpi-value" id="kpi-regs">—</div><div class="kpi-delta">Launch signups</div></div>
+              <div class="kpi-card"><div class="kpi-label">Application</div><div class="kpi-value" id="kpi-status" style="font-size:15px;padding-top:6px">—</div><div class="kpi-delta" id="kpi-host">—</div></div>
+              <div class="kpi-card"><div class="kpi-label">PHP Runtime</div><div class="kpi-value" id="kpi-php" style="font-size:16px;padding-top:5px">—</div><div class="kpi-delta">App server</div></div>
             </div>
-            <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="dash-grid">
               <div class="dash-panel">
-                <div class="panel-header"><div class="panel-title">System Health</div><div class="panel-meta">Live</div></div>
-                <div class="sys-status-grid" id="sys-status"><div class="sys-item"><span class="sys-name">Loading...</span></div></div>
+                <div class="panel-header"><div class="panel-title">Recent Web Telemetry</div><div class="panel-meta" id="tele-count">—</div></div>
+                <table class="tele-table">
+                  <thead><tr><th>Timestamp</th><th>Path</th><th>User Agent</th></tr></thead>
+                  <tbody id="tele-body"><tr><td colspan="3" style="color:var(--slate);padding:20px 0;font-size:12px">Loading...</td></tr></tbody>
+                </table>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:14px">
+                <div class="dash-panel">
+                  <div class="panel-header"><div class="panel-title">System Health</div><div class="panel-meta">Live</div></div>
+                  <div class="sys-status-grid" id="sys-status"><div class="sys-item"><span class="sys-name">Loading...</span></div></div>
+                </div>
+                <div class="dash-panel">
+                  <div class="panel-header"><div class="panel-title">Security Events</div><div class="panel-meta">Simulated</div></div>
+                  <div class="alert-feed">
+                    <div class="alert-item med"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">Unusual outbound DNS query pattern on POS-03</div><div class="alert-time">2026-09-03 07:41:22 — Zeek · MEDIUM</div></div></div>
+                    <div class="alert-item low"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">New device fingerprint on management VLAN</div><div class="alert-time">2026-09-03 06:18:04 — Suricata · LOW</div></div></div>
+                    <div class="alert-item low"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">SSL certificate change on payment gateway endpoint</div><div class="alert-time">2026-09-03 05:02:55 — Zeek · LOW</div></div></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="dash-panel">
+              <div class="panel-header"><div class="panel-title">Launch Registrations</div><div class="panel-meta" id="reg-count">—</div></div>
+              <div id="reg-body"><div class="reg-empty">Loading...</div></div>
+            </div>
+          </div>
+
+          <!-- PAYMENT GATEWAY PANEL -->
+          <div id="payment-panel" style="display:none">
+            <div class="dash-title">Payment Gateway</div>
+            <div class="dash-subtitle" style="color:var(--amber)">Mock PayMongo — Sandbox Mode</div>
+            <div class="dash-grid">
+              <div class="dash-panel">
+                <div class="panel-header">
+                  <div class="panel-title">Transaction Log</div>
+                  <div class="panel-meta" id="tx-meta">—</div>
+                </div>
+                <div class="tx-kpi">
+                  <div class="tx-kpi-card"><div class="tx-kpi-label">Total</div><div class="tx-kpi-value" id="tx-total">—</div></div>
+                  <div class="tx-kpi-card"><div class="tx-kpi-label">Paid</div><div class="tx-kpi-value" id="tx-paid" style="color:var(--green)">—</div></div>
+                  <div class="tx-kpi-card"><div class="tx-kpi-label">Volume</div><div class="tx-kpi-value" id="tx-volume" style="font-size:14px;padding-top:4px">—</div></div>
+                </div>
+                <table class="tele-table">
+                  <thead><tr><th>PayMongo ID</th><th>Amount</th><th>Description</th><th>Source</th><th>Status</th><th>Time</th></tr></thead>
+                  <tbody id="tx-body"><tr><td colspan="6" style="color:var(--slate);padding:20px 0;font-size:12px">No transactions yet.</td></tr></tbody>
+                </table>
               </div>
               <div class="dash-panel">
-                <div class="panel-header"><div class="panel-title">Security Events</div><div class="panel-meta">Simulated</div></div>
-                <div class="alert-feed">
-                  <div class="alert-item med"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">Unusual outbound DNS query pattern on POS-03</div><div class="alert-time">2026-09-03 07:41:22 — Zeek · MEDIUM</div></div></div>
-                  <div class="alert-item low"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">New device fingerprint on management VLAN</div><div class="alert-time">2026-09-03 06:18:04 — Suricata · LOW</div></div></div>
-                  <div class="alert-item low"><div class="alert-dot"></div><div class="alert-content"><div class="alert-msg">SSL certificate change on payment gateway endpoint</div><div class="alert-time">2026-09-03 05:02:55 — Zeek · LOW</div></div></div>
+                <div class="panel-header"><div class="panel-title">Initiate Payment</div><div class="panel-meta">Mock PayMongo</div></div>
+                <div class="pay-form">
+                  <div>
+                    <label class="pay-label">Amount (centavos)</label>
+                    <input class="pay-input" type="number" id="pay-amount" placeholder="10000 = ₱100.00" min="100">
+                  </div>
+                  <div>
+                    <label class="pay-label">Description</label>
+                    <input class="pay-input" type="text" id="pay-desc" placeholder="Payment description">
+                  </div>
+                  <div>
+                    <label class="pay-label">Source Type</label>
+                    <select class="pay-select" id="pay-source">
+                      <option value="card">Card</option>
+                      <option value="gcash">GCash</option>
+                      <option value="maya">Maya</option>
+                      <option value="instapay">InstaPay</option>
+                      <option value="pesonet">PESONet</option>
+                    </select>
+                  </div>
+                  <div style="background:var(--navy);border:1px solid var(--border-subtle);padding:12px;font-size:11px;color:var(--slate);line-height:1.8">
+                    <strong style="color:var(--teal);display:block;margin-bottom:4px">Mock Webhook Flow</strong>
+                    Pay → MariaDB (pending) → Signature computed → Webhook processed inline → MariaDB (paid) → Log refreshed
+                  </div>
+                  <button class="btn-pay" id="btn-pay" onclick="doPayment()">Process Payment</button>
+                  <div class="pay-msg" id="pay-msg"></div>
                 </div>
               </div>
             </div>
           </div>
-          <div class="dash-panel">
-            <div class="panel-header"><div class="panel-title">Launch Registrations</div><div class="panel-meta" id="reg-count">—</div></div>
-            <div id="reg-body"><div class="reg-empty">Loading...</div></div>
-          </div>
+
         </div>
       </div>
       <footer style="margin-top:0">
@@ -518,9 +684,6 @@ data:
     </div>
 
     <script>
-    const ADMIN_USER='';
-    const ADMIN_PASS='';
-
     function showView(id){
       document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
       document.getElementById(id).classList.add('active');
@@ -531,51 +694,105 @@ data:
       document.getElementById(id).scrollIntoView({behavior:'smooth'});
     }
 
-    function doLogout(){
-      window.location.href='?logout=1';
+    function showDashPanel(panel) {
+      document.getElementById('main-panel').style.display    = panel === 'dashboard' ? 'block' : 'none';
+      document.getElementById('payment-panel').style.display = panel === 'payment'   ? 'block' : 'none';
+      document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+      document.getElementById('nav-' + (panel === 'payment' ? 'payment' : 'dashboard')).classList.add('active');
+      if (panel === 'payment') loadTransactions();
+    }
+
+    async function doPayment() {
+      const amount = document.getElementById('pay-amount').value.trim();
+      const desc   = document.getElementById('pay-desc').value.trim();
+      const source = document.getElementById('pay-source').value;
+      const msg    = document.getElementById('pay-msg');
+      const btn    = document.getElementById('btn-pay');
+      if (!amount || parseInt(amount) < 100) {
+        msg.className = 'pay-msg err'; msg.style.display = 'block';
+        msg.textContent = 'Minimum amount is 100 centavos (₱1.00)'; return;
+      }
+      btn.disabled = true; btn.textContent = 'Processing...';
+      try {
+        const res = await fetch('/?api=pay', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: `amount=${encodeURIComponent(amount)}&description=${encodeURIComponent(desc)}&source_type=${encodeURIComponent(source)}`
+        });
+        const data = await res.json();
+        msg.className = 'pay-msg ' + (data.success ? 'ok' : 'err');
+        msg.style.display = 'block';
+        msg.textContent = data.success ? `✓ ${data.message} — ${data.paymongo_id}` : data.message;
+        if (data.success) {
+          document.getElementById('pay-amount').value = '';
+          document.getElementById('pay-desc').value   = '';
+          setTimeout(loadTransactions, 500);
+        }
+      } catch(e) {
+        msg.className = 'pay-msg err'; msg.style.display = 'block';
+        msg.textContent = 'Request failed.';
+      }
+      btn.disabled = false; btn.textContent = 'Process Payment';
+    }
+
+    async function loadTransactions() {
+      try {
+        const res = await fetch('/?api=transactions');
+        if (!res.ok) return;
+        const d = await res.json();
+        document.getElementById('tx-total').textContent = d.total ?? '—';
+        document.getElementById('tx-paid').textContent  = d.paid  ?? '—';
+        document.getElementById('tx-meta').textContent  = d.total + ' transactions';
+        const txs = d.transactions ?? [];
+        const vol = txs.filter(t => t.status === 'paid').reduce((s,t) => s + parseInt(t.amount), 0);
+        document.getElementById('tx-volume').textContent = '₱' + (vol/100).toLocaleString('en-PH',{minimumFractionDigits:2});
+        document.getElementById('tx-body').innerHTML = txs.length === 0
+          ? '<tr><td colspan="6" style="color:var(--slate);padding:20px 0;font-size:12px">No transactions yet.</td></tr>'
+          : txs.map(t => `<tr>
+              <td style="font-family:monospace;font-size:10px">${t.paymongo_id.replace('pay_mock_','mock_')}</td>
+              <td style="color:var(--white)">₱${(parseInt(t.amount)/100).toFixed(2)}</td>
+              <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.description??'—'}</td>
+              <td>${t.source_type??'—'}</td>
+              <td><span class="tx-status ${t.status}">${t.status.toUpperCase()}</span></td>
+              <td style="font-size:11px">${t.created_at}</td>
+            </tr>`).join('');
+      } catch(e) {}
     }
 
     async function doRegister(){
       const email = document.getElementById('notify-email').value.trim();
-      const msg = document.getElementById('notify-msg');
+      const msg   = document.getElementById('notify-msg');
       if (!email) {
-        msg.className = 'notify-msg err';
-        msg.style.display = 'block';
-        msg.textContent = 'Please enter a valid email address.';
-        return;
+        msg.className = 'notify-msg err'; msg.style.display = 'block';
+        msg.textContent = 'Please enter a valid email address.'; return;
       }
       try {
-        const res = await fetch('/', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-          body: 'email=' + encodeURIComponent(email)
-        });
+        const res  = await fetch('/', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(email)});
         const data = await res.json();
         msg.className = 'notify-msg ' + (data.success ? 'ok' : 'err');
         msg.style.display = 'block';
         msg.textContent = data.message;
         if (data.success) document.getElementById('notify-email').value = '';
       } catch(e) {
-        msg.className = 'notify-msg err';
-        msg.style.display = 'block';
+        msg.className = 'notify-msg err'; msg.style.display = 'block';
         msg.textContent = 'Request failed. Please try again.';
       }
     }
 
     function updateClock(){
-      const el=document.getElementById('dash-time');
-      if(el) el.textContent=new Date().toLocaleString('en-PH',{weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+      const el = document.getElementById('dash-time');
+      if (el) el.textContent = new Date().toLocaleString('en-PH',{weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
     }
 
     async function loadDashboard(){
       updateClock();
       setInterval(updateClock,1000);
-      try{
-        const res=await fetch('?api=dashboard');
-        if(!res.ok) throw new Error();
-        const d=await res.json();
+      try {
+        const res = await fetch('?api=dashboard');
+        if (!res.ok) throw new Error();
+        const d = await res.json();
         renderDashboard(d);
-      } catch(e){
+      } catch(e) {
         renderDashboard({
           visits:0,registrations:0,
           status:{application:'ONLINE',php:'<?= $php_version ?>',mariadb:'<?= $mariadb_status ?>',host:'<?= $hostname ?>'},
@@ -585,31 +802,30 @@ data:
     }
 
     function renderDashboard(d){
-      document.getElementById('kpi-visits').textContent=d.visits??'—';
-      document.getElementById('kpi-regs').textContent=d.registrations??'—';
-      document.getElementById('kpi-status').textContent=d.status?.application??'—';
-      document.getElementById('kpi-php').textContent=d.status?.php??'—';
-      document.getElementById('kpi-host').textContent=d.status?.host??'—';
-      const mdb=d.status?.mariadb??'—';
-      document.getElementById('sys-status').innerHTML=`
+      document.getElementById('kpi-visits').textContent = d.visits ?? '—';
+      document.getElementById('kpi-regs').textContent   = d.registrations ?? '—';
+      document.getElementById('kpi-status').textContent = d.status?.application ?? '—';
+      document.getElementById('kpi-php').textContent    = d.status?.php ?? '—';
+      document.getElementById('kpi-host').textContent   = d.status?.host ?? '—';
+      const mdb = d.status?.mariadb ?? '—';
+      document.getElementById('sys-status').innerHTML = `
         <div class="sys-item"><span class="sys-name">Application</span><span class="sys-badge online">${d.status?.application??'—'}</span></div>
         <div class="sys-item"><span class="sys-name">PHP Runtime</span><span class="sys-badge ready">${d.status?.php??'—'}</span></div>
         <div class="sys-item"><span class="sys-name">MariaDB</span><span class="sys-badge ${mdb==='ONLINE'?'online':'offline'}">${mdb}</span></div>
         <div class="sys-item"><span class="sys-name">Host Pod</span><span class="sys-badge ready">${d.status?.host??'—'}</span></div>
       `;
-      const tele=d.telemetry??[];
-      document.getElementById('tele-count').textContent=tele.length+' entries';
-      document.getElementById('tele-body').innerHTML=tele.length===0
-        ?'<tr><td colspan="3" style="color:var(--slate);padding:20px 0;font-size:12px">No telemetry recorded</td></tr>'
-        :tele.map(t=>`<tr><td>${t.timestamp}</td><td style="color:var(--white)">${t.path}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.ua}</td></tr>`).join('');
-      const regs=d.registrations_list??[];
-      document.getElementById('reg-count').textContent=regs.length+' total';
-      document.getElementById('reg-body').innerHTML=regs.length===0
-        ?'<div class="reg-empty">No registrations yet.</div>'
-        :`<table class="tele-table"><thead><tr><th>Email</th><th>Registered</th></tr></thead><tbody>${regs.map(r=>`<tr><td>${r.email}</td><td style="color:var(--slate-light)">${r.created_at}</td></tr>`).join('')}</tbody></table>`;
+      const tele = d.telemetry ?? [];
+      document.getElementById('tele-count').textContent = tele.length + ' entries';
+      document.getElementById('tele-body').innerHTML = tele.length === 0
+        ? '<tr><td colspan="3" style="color:var(--slate);padding:20px 0;font-size:12px">No telemetry recorded</td></tr>'
+        : tele.map(t=>`<tr><td>${t.timestamp}</td><td style="color:var(--white)">${t.path}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.ua}</td></tr>`).join('');
+      const regs = d.registrations_list ?? [];
+      document.getElementById('reg-count').textContent = regs.length + ' total';
+      document.getElementById('reg-body').innerHTML = regs.length === 0
+        ? '<div class="reg-empty">No registrations yet.</div>'
+        : `<table class="tele-table"><thead><tr><th>Email</th><th>Registered</th></tr></thead><tbody>${regs.map(r=>`<tr><td>${r.email}</td><td style="color:var(--slate-light)">${r.created_at}</td></tr>`).join('')}</tbody></table>`;
     }
 
-    // Init — show correct view based on PHP session state
     <?php if ($is_auth): ?>
     document.addEventListener('DOMContentLoaded',()=>{ showView('dashboard'); loadDashboard(); });
     <?php elseif (isset($_GET['view']) && $_GET['view']==='login'): ?>
