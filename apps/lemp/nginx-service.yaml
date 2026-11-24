@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: lemp
+spec:
+  clusterIP: 10.99.220.26
+  clusterIPs:
+  - 10.99.220.26
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - nodePort: 30080
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: nginx
+  sessionAffinity: None
+  type: NodePort
+
