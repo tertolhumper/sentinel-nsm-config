@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: php-fpm-config
+  namespace: lemp
+data:
+  www.conf: |
+    [www]
+    user = www-data
+    group = www-data
+    listen = 9000
+    pm = dynamic
+    pm.max_children = 10
+    pm.start_servers = 3
+    pm.min_spare_servers = 2
+    pm.max_spare_servers = 5
+    pm.max_requests = 500

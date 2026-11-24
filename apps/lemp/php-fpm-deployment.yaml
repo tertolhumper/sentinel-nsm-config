@@ -37,7 +37,13 @@ spec:
         volumeMounts:
         - mountPath: /var/www/html
           name: php-app
+        - mountPath: /usr/local/etc/php-fpm.d/www.conf
+          name: php-fpm-config
+          subPath: www.conf
       volumes:
       - name: php-app
         configMap:
           name: php-app
+      - name: php-fpm-config
+        configMap:
+          name: php-fpm-config
