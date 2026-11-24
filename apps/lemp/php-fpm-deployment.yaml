@@ -17,10 +17,6 @@ spec:
       - name: php-fpm
         image: ghcr.io/tertolhumper/sentinel-nsm-app:22
         imagePullPolicy: Always
-        command:
-        - sh
-        - -c
-        - docker-php-ext-install mysqli pdo_mysql && php-fpm
         ports:
         - containerPort: 9000
         env:
