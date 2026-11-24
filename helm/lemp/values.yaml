@@ -28,7 +28,7 @@ nginx:
   service:
     type: NodePort
     nodePort: 30080
-  replicas: 2
+  replicas: 4
 
 phpfpm:
-  replicas: 2
+  replicas: 4
