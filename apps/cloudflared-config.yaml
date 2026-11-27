@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: lemp
+data:
+  config.yml: |
+    tunnel: 1d5a927b-ae15-446b-9b1c-676826f88174
+    credentials-file: /etc/cloudflared/creds/credentials.json
+
+    ingress:
+      - hostname: sentinel-nsm.com
+        service: http://nginx.lemp.svc.cluster.local:80
+      - hostname: www.sentinel-nsm.com
+        service: http://nginx.lemp.svc.cluster.local:80
+      - service: http_status:404
