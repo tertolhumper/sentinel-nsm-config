@@ -10,8 +10,10 @@ spec:
     chart: headlamp
     targetRevision: 0.46.0
     helm:
-      valueFiles:
-        - values.yaml
+      values: |
+        service:
+          type: NodePort
+          nodePort: 30083
   destination:
     server: https://kubernetes.default.svc
     namespace: headlamp

@@ -1,9 +1,3 @@
 service:
   type: NodePort
-  nodePort: 30090
-
-ingress:
-  enabled: false
-
-config:
-  pluginsDir: /headlamp/plugins
+  nodePort: 30083
